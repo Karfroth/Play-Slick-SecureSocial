@@ -46,12 +46,11 @@ class MyUserService @Inject()(userAccess: UserDataAccess)(protected val dbConfig
   private var tokens = Map[String, MailToken]()
 
   def find(providerId: String, userId: String): Future[Option[BasicProfile]] = {
-    val u = userAccess.getUserQueryTuple.filter{
-      queryTuple => 
-        queryTuple._1.providerId === providerId && queryTuple._1.userId === userId
+    val u = userAccess.profiles.filter{ p => 
+      p.providerId === providerId && p.userId === userId
     }
     
-    userAccess.getBasicProfile(u).map(_.headOption)
+    db.run(u.take(1).result).map(_.headOption).map( uo => uo.map(u => u.toBasicProfile))
   }
 
   def findByEmailAndProvider(email: String, providerId: String): Future[Option[BasicProfile]] = {
@@ -59,118 +58,88 @@ class MyUserService @Inject()(userAccess: UserDataAccess)(protected val dbConfig
       logger.debug("users = %s".format(users))
     }
 
-    val u = userAccess.getUserQueryTuple.filter{
-      queryTuple => 
-        queryTuple._1.providerId === providerId && queryTuple._1.email === Option(email)
+    val u = userAccess.profiles.filter{ p => 
+        p.providerId === providerId && p.email === Option(email)
     }
     
-    userAccess.getBasicProfile(u).map(_.headOption)
+    db.run(u.take(1).result).map(_.headOption).map( uo => uo.map(u => u.toBasicProfile))
   }
 
-  // This has to be optimized.
-  private def getBasicUser(id: String, mainId: Long) = {
-    val mainFuture = userAccess.getBasicProfile {
-        userAccess.getUserQueryTuple.filter(_._1.id === mainId).take(1)
+  private def findProfile(profile: BasicProfile, profiderId: String) = {
+    val q = userAccess.profiles.filter{
+      p => p.userId === profile.userId && p.providerId === profiderId
     }
-    val identitiesFuture = {
-      val q = userAccess.getUserQueryTuple.filter(p => p._1.userId === id)
-      db.run(q.result).map(seq => userAccess.tupleToProfile(seq))
-    }
-    val main = Await.result(mainFuture, Duration.Inf).head
-    val identity = Await.result(identitiesFuture, Duration.Inf).toList
-    BasicUser(main, identity)
-  }
-  
-  private def findProfile(profile: BasicProfile) = {
-    val q = userAccess.getUserQueryTuple.filter{
-      p => p._1.userId === profile.userId && p._1.providerId === profile.providerId
-    }
-    
-    userAccess.getBasicProfile(q).map(_.headOption)
+ 
+    db.run(q.result).map(_.headOption).map(po => po.map(p => p.toBasicProfile))
   }
   
   private def updateProfile(profile: BasicProfile) = {
-    // Need more work
-
-    val updater = for {
-      target <- userAccess.profiles if target.userId === profile.userId && target.providerId === profile.providerId
-    } yield (target.providerId,
-             target.userId,
-             target.firstName,
-             target.lastName,
-             target.fullName,
-             target.email,
-             target.avatarUrl,
-             target.authMethod,
-             target.oAuth1Id,
-             target.oAuth2Id,
-             target.passwordId)
-             
-    val target = Await.result(db.run(updater.result), Duration.Inf).head
+    val q = for { 
+      p <- userAccess.profiles if p.userId === profile.userId && p.providerId === profile.providerId 
+      } yield (
+          p.providerId,
+          p.userId,
+          p.firstName,
+          p.lastName,
+          p.fullName,
+          p.email,
+          p.avatarUrl,
+          p.authMethod,
+          (p.oAuth1Token, p.oAuth1Secret),
+          (p.oAuth2AccessToken, p.oAuth2TokenType,
+          p.oAuth2ExpiresIn, p.oAuth2RefreshToken),
+          (p.passwordHasher, p.passwordPassword, p.passwordSalt)
+        )
+    val updateQuery = q.update(profile.providerId,
+        profile.userId,
+        profile.firstName,
+        profile.lastName,
+        profile.fullName,
+        profile.email,
+        profile.avatarUrl,
+        profile.authMethod.method,
+        profile.oAuth1Info match {
+          case None => (None, None)
+          case Some(OAuth1Info(t, s)) => (Option(t), Option(s))
+        },
+        profile.oAuth2Info match {
+          case None => (None, None, None, None)
+          case Some(OAuth2Info(a, t, e, r)) => (Option(a), t, e, r)
+        },
+        profile.passwordInfo match {
+          case None => (None, None, None)
+          case Some(PasswordInfo(h, p, s)) => (Option(h), Option(p), s)
+        })
     
-    if (!profile.oAuth1Info.isEmpty) {
-      (for {
-        o1 <- userAccess.oauth1s if o1.id === target._9
-      } yield (o1.token, o1.secret)).update(
-          profile.oAuth1Info.get.token, profile.oAuth1Info.get.secret)
+    val innerJoin = for {
+      (utp, p) <- userAccess.usersToProfiles.join(userAccess.profiles).on(_.profileId === _.id)
+    } yield (utp, p)
+    
+    val profileSession = (for {
+      pid <- userAccess.profiles.filter{ p => 
+          p.userId === profile.userId && p.providerId === profile.providerId
+        }.result.map(_.head.id)
+      userId <- userAccess.usersToProfiles.filter{ utp => 
+          utp.profileId === pid
+        }.result.map(_.head.userId)
+      mainId <- userAccess.users.filter { u =>
+        u.id === userId
+      }.result.map(_.head.mainId)
+      profiles <- innerJoin.filter(_._1.userId === userId).result.map(o => o.map(_._2))
+    } yield (mainId, profiles))  
+    
+    db.run(profileSession).map { tup =>
+      val mainId = tup._1
+      val main = tup._2.filter(_.id == mainId).head
+      val identities = tup._2.filterNot(_.id != mainId)
+      BasicUser(main.toBasicProfile, identities.map(_.toBasicProfile).toList)
     }
-    
-    if (!profile.oAuth2Info.isEmpty) {
-      (for {
-        o2 <- userAccess.oauth2s if o2.id === target._10
-      } yield (o2.accessToken, o2.tokenType, o2.expiresIn, o2.refreshToken)).update(
-          profile.oAuth2Info.get.accessToken, profile.oAuth2Info.get.tokenType, 
-          profile.oAuth2Info.get.expiresIn, profile.oAuth2Info.get.refreshToken)
-    }
-    
-    if (!profile.passwordInfo.isEmpty) {
-      (for {
-        p <- userAccess.passwords if p.id === target._11
-      } yield (p.hasher, p.password, p.salt)).update(
-          profile.passwordInfo.get.hasher, profile.passwordInfo.get.password, 
-          profile.passwordInfo.get.salt)
-    }
-    
-    val q = updater.update(profile.providerId,
-                           profile.userId,
-                           profile.firstName,
-                           profile.lastName,
-                           profile.fullName,
-                           profile.email,
-                           profile.avatarUrl,
-                           profile.authMethod.method,
-                           target._9,
-                           target._10,
-                           target._11)
-                           
-    db.run(q)
-    
-    val user = db.run(userAccess.users.filter( u => u.id === profile.userId ).result)
-    user.map(_.head).map(u => getBasicUser(u.id, u.mainId))
-    
   }
   
   private def saveNewUser(profile: BasicProfile) = {
-    val oauth1id = {
-        val idOption = profile.oAuth1Info.map{ o1 =>
-          (userAccess.oauth1s returning userAccess.oauth1s.map(_.id)) += OAuth1(None, o1.token, o1.secret)
-        }
-        idOption.map(v => db.run(v))
-      } 
-    val oauth2id = {
-        val idOption = profile.oAuth2Info.map{ o2 =>
-            (userAccess.oauth2s returning userAccess.oauth2s.map(_.id)) += OAuth2(None, o2.accessToken, o2.tokenType, o2.expiresIn, o2.refreshToken)
-        }
-        idOption.map(v => db.run(v))
-    }
-    val passwordinfo = {
-        val passOption = profile.passwordInfo.map { p =>
-          (userAccess.passwords returning userAccess.passwords.map(_.id)) += Password(None, p.hasher, p.password, p.salt)
-        }
-        passOption.map(v => db.run(v))
-    }
     val session = (for {
-          pID <- (userAccess.profiles returning userAccess.profiles.map(_.id)) += Profile(
+          profileId <- 
+            (userAccess.profiles returning userAccess.profiles.map(_.id)) += Profile(
                   None,
                   profile.providerId,
                   profile.userId,
@@ -179,25 +148,29 @@ class MyUserService @Inject()(userAccess: UserDataAccess)(protected val dbConfig
                   profile.fullName,
                   profile.email,
                   profile.avatarUrl,
-                  profile.authMethod.method,
-                  oauth1id match {
-                    case Some(o1) => Option(Await.result(o1, Duration.Inf))
-                    case None => None
-                  },
-                  oauth2id match {
-                    case Some(o2) => Option(Await.result(o2, Duration.Inf))
-                    case None => None
-                  },
-                  passwordinfo match {
-                    case Some(p) => Option(Await.result(p, Duration.Inf))
-                    case None => None
-                  }
+                  profile.authMethod,
+                  profile.oAuth1Info,
+                  profile.oAuth2Info,
+                  profile.passwordInfo
               )
-          user <- (userAccess.users returning userAccess.users.map(_.id)
-                       into ((user,id) => user.copy(id=id))) += User(profile.userId, pID)
-        } yield (user)).transactionally
-        val newUser = db.run(session)
-        newUser.map(u => getBasicUser(u.id, u.mainId))
+          uId <- (userAccess.users returning userAccess.users.map(_.id)) += User(0, profileId)
+          uTp <- (userAccess.usersToProfiles returning userAccess.usersToProfiles.map(_.id)
+              into ((userToProfile,id) => userToProfile.copy(id=id))) += UserToProfile(0, uId, profileId)
+        } yield (uTp)).transactionally
+    val newUser = db.run(session)
+    val q = newUser.map{ utp => (for {
+        identities <- userAccess.profiles.filter(_.id === utp.profileId).result
+        user <- userAccess.users.filter(_.id === utp.userId).result
+      } yield (identities, user)).transactionally
+    }
+    q.flatMap{ r => 
+        db.run(r).map{tup => 
+            val main = tup._1.filter(_.id == tup._2.head.mainId).head
+            val identities = tup._1.filterNot(_.id == tup._2.head.mainId)
+            
+            BasicUser(main.toBasicProfile, identities.map(_.toBasicProfile).toList)
+          }
+      }
   }
   
   def save(profile: BasicProfile, mode: SaveMode): Future[BasicUser] = {
@@ -206,7 +179,7 @@ class MyUserService @Inject()(userAccess: UserDataAccess)(protected val dbConfig
         saveNewUser(profile)
       case SaveMode.LoggedIn =>
         // first see if there is a user with this BasicProfile already.
-        findProfile(profile).flatMap {p =>
+        findProfile(profile, profile.providerId).flatMap {p =>
           p match {
             case Some(existingUser) =>
               updateProfile(profile)
@@ -216,22 +189,14 @@ class MyUserService @Inject()(userAccess: UserDataAccess)(protected val dbConfig
         }
 
       case SaveMode.PasswordChange =>
-        val passwordIdQuery = userAccess.profiles
-            .filter(p => p.userId === profile.userId && p.providerId === UsernamePasswordProvider.UsernamePassword)
-            
-        val passwordId = Await.result(db.run(passwordIdQuery.result).map(_.head.passwordId), Duration.Inf)
-        
-        userAccess.passwords.filter{ p =>
-          p.id === passwordId
-        }.update(
-            Password(passwordId, 
-              profile.passwordInfo.get.hasher, 
-              profile.passwordInfo.get.password, 
-              profile.passwordInfo.get.salt)
-            )
-        
-        val user = db.run(userAccess.users.filter( u => u.id === profile.userId ).result)
-        user.map(_.head).map(u => getBasicUser(u.id, u.mainId))
+        findProfile(profile, UsernamePasswordProvider.UsernamePassword).flatMap{ p =>
+          p match {
+            case Some(existingUser) =>
+              updateProfile(profile)
+            case None =>
+              throw new Exception("No User")
+          }
+        }
     }
   }
 
